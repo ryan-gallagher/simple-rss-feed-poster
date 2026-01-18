@@ -2,31 +2,33 @@
 /*
 Plugin Name: Simple RSS Feed Poster
 Description: Fetches and posts new links from a single RSS feed, sorted alphabetically, with scheduled posting and preview.
-Version: 2.2.0
+Version: 2.3.0
 Author: Ryan Gallagher
 */
 
 /*
 Changelog:
-2.2.0 - Added: Full string replacements (for complex site names with colons)
+2.3.0 - Added: Post days selection (choose specific days for weekly/custom schedules)
+        Added: Minimum items threshold (skip posting if not enough new links)
+        Added: Post header and footer text options
+
+2.2.0 - Added: Full string replacements for complex site names with colons
         Added: Post status setting (publish or draft)
         Added: Link format setting (full link, bold prefix, or link only)
         Fixed: Scheduled time display now shows correct timezone
 
-2.1.0 - Added: Title prefix replacement rules (define custom mappings for bad feed names)
-        Added: Option to auto-strip suspicious prefixes (hostnames, URL fragments)
-        Added: HTML entity decoding and whitespace normalization for cleaner titles
+2.1.0 - Added: Title prefix replacement rules
+        Added: Option to auto-strip suspicious prefixes
+        Added: HTML entity decoding and whitespace normalization
         Added: Empty/malformed entries are now skipped
 
 2.0.0 - Major revision:
-        - Fixed: Cron now actually fires at configured time (was ignoring post_time setting)
-        - Fixed: Duplicate tracking now uses link-only approach (removed timestamp comparison that could miss late-added items)
-        - Fixed: Posted links array now auto-prunes to last 500 entries to prevent unbounded growth
-        - Fixed: AJAX preview now verifies nonce for security
-        - Fixed: Feed errors now log the actual error message for troubleshooting
-        - Fixed: Preview and post now use same item limit (100) for consistency
-        - Added: Fallback to uncategorized with admin notice if selected category is deleted
-        - Removed: Unused auto_post_threshold option
+        - Fixed: Cron now fires at configured time
+        - Fixed: Duplicate tracking uses link-only approach
+        - Fixed: Posted links array auto-prunes to prevent unbounded growth
+        - Fixed: AJAX preview verifies nonce for security
+        - Fixed: Feed errors log actual error message
+        - Added: Category validation with fallback
         - Improved: Better error handling throughout
         
 1.9.5 - Added: "Next Scheduled Post" preview in admin. Fixed function order to prevent syntax errors.
@@ -41,6 +43,7 @@ Changelog:
 define('SIMPLE_RSS_POSTER_MAX_TRACKED_LINKS', 500);
 define('SIMPLE_RSS_POSTER_FEED_ITEM_LIMIT', 100);
 define('SIMPLE_RSS_POSTER_CRON_HOOK', 'simple_rss_poster_scheduled_post');
+define('SIMPLE_RSS_POSTER_DAYS', ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']);
 
 //------------------------------------------------------------------------------
 // 2. Sanitization & Registration
@@ -81,7 +84,7 @@ function simple_rss_poster_sanitize_category($input) {
 }
 
 /**
- * Sanitizes textarea inputs (replacements).
+ * Sanitizes textarea inputs (replacements, header, footer).
  */
 function simple_rss_poster_sanitize_replacements($input) {
     $lines = explode("\n", $input);
@@ -113,6 +116,29 @@ function simple_rss_poster_sanitize_link_format($input) {
     return in_array($input, $allowed, true) ? $input : 'full_link';
 }
 
+/**
+ * Sanitizes post days array.
+ */
+function simple_rss_poster_sanitize_post_days($input) {
+    if (!is_array($input)) {
+        return array_fill_keys(SIMPLE_RSS_POSTER_DAYS, 1); // Default to all days
+    }
+    
+    $clean = [];
+    foreach (SIMPLE_RSS_POSTER_DAYS as $day) {
+        $clean[$day] = isset($input[$day]) ? 1 : 0;
+    }
+    return $clean;
+}
+
+/**
+ * Sanitizes minimum items (must be 0 or positive integer).
+ */
+function simple_rss_poster_sanitize_min_items($input) {
+    $value = absint($input);
+    return $value;
+}
+
 function simple_rss_poster_register_settings() {
     register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_feed_url', [
         'sanitize_callback' => 'esc_url_raw'
@@ -125,6 +151,10 @@ function simple_rss_poster_register_settings() {
         'sanitize_callback' => 'simple_rss_poster_sanitize_post_time',
         'default' => '00:00'
     ]);
+    register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_post_days', [
+        'sanitize_callback' => 'simple_rss_poster_sanitize_post_days',
+        'default' => array_fill_keys(SIMPLE_RSS_POSTER_DAYS, 1)
+    ]);
     register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_post_category', [
         'sanitize_callback' => 'simple_rss_poster_sanitize_category',
         'default' => 0
@@ -136,6 +166,18 @@ function simple_rss_poster_register_settings() {
     register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_link_format', [
         'sanitize_callback' => 'simple_rss_poster_sanitize_link_format',
         'default' => 'full_link'
+    ]);
+    register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_min_items', [
+        'sanitize_callback' => 'simple_rss_poster_sanitize_min_items',
+        'default' => 1
+    ]);
+    register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_post_header', [
+        'sanitize_callback' => 'wp_kses_post',
+        'default' => ''
+    ]);
+    register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_post_footer', [
+        'sanitize_callback' => 'wp_kses_post',
+        'default' => ''
     ]);
     register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_full_replacements', [
         'sanitize_callback' => 'simple_rss_poster_sanitize_replacements',
@@ -153,7 +195,7 @@ function simple_rss_poster_register_settings() {
 add_action('admin_init', 'simple_rss_poster_register_settings');
 
 /**
- * Reschedule cron when post time setting changes.
+ * Reschedule cron when post time or post days settings change.
  */
 function simple_rss_poster_maybe_reschedule($old_value, $new_value) {
     if ($old_value !== $new_value) {
@@ -161,6 +203,7 @@ function simple_rss_poster_maybe_reschedule($old_value, $new_value) {
     }
 }
 add_action('update_option_simple_rss_poster_post_time', 'simple_rss_poster_maybe_reschedule', 10, 2);
+add_action('update_option_simple_rss_poster_post_days', 'simple_rss_poster_maybe_reschedule', 10, 2);
 
 //------------------------------------------------------------------------------
 // 3. Admin UI
@@ -197,9 +240,13 @@ function simple_rss_poster_settings_page() {
     $feed_url            = get_option('simple_rss_poster_feed_url', '');
     $post_title          = get_option('simple_rss_poster_post_title', 'Latest Links');
     $post_time           = get_option('simple_rss_poster_post_time', '00:00');
+    $post_days           = get_option('simple_rss_poster_post_days', array_fill_keys(SIMPLE_RSS_POSTER_DAYS, 1));
     $post_category       = get_option('simple_rss_poster_post_category', 0);
     $post_status         = get_option('simple_rss_poster_post_status', 'publish');
     $link_format         = get_option('simple_rss_poster_link_format', 'full_link');
+    $min_items           = get_option('simple_rss_poster_min_items', 1);
+    $post_header         = get_option('simple_rss_poster_post_header', '');
+    $post_footer         = get_option('simple_rss_poster_post_footer', '');
     $full_replacements   = get_option('simple_rss_poster_full_replacements', '');
     $title_replacements  = get_option('simple_rss_poster_title_replacements', '');
     $auto_strip          = get_option('simple_rss_poster_auto_strip_suspicious', false);
@@ -210,7 +257,7 @@ function simple_rss_poster_settings_page() {
     // Get next scheduled run from WP-Cron (fixed timezone display)
     $next_scheduled = wp_next_scheduled(SIMPLE_RSS_POSTER_CRON_HOOK);
     $next_run = $next_scheduled 
-        ? wp_date('F j, Y @ g:i a', $next_scheduled) 
+        ? wp_date('l, F j, Y @ g:i a', $next_scheduled) 
         : 'Not scheduled - save settings to schedule';
 
     // Create nonce for AJAX
@@ -250,16 +297,6 @@ function simple_rss_poster_settings_page() {
                     </td>
                 </tr>
                 <tr>
-                    <th scope="row"><label for="simple_rss_poster_post_time">Daily Post Time</label></th>
-                    <td>
-                        <input type="time" 
-                               id="simple_rss_poster_post_time"
-                               name="simple_rss_poster_post_time" 
-                               value="<?php echo esc_attr($post_time); ?>">
-                        <p class="description">Time in your WordPress timezone (<?php echo esc_html(wp_timezone_string()); ?>)</p>
-                    </td>
-                </tr>
-                <tr>
                     <th scope="row"><label for="simple_rss_poster_post_category">Post Category</label></th>
                     <td>
                         <select id="simple_rss_poster_post_category" name="simple_rss_poster_post_category">
@@ -284,6 +321,53 @@ function simple_rss_poster_settings_page() {
                 </tr>
             </table>
             
+            <h2>Schedule</h2>
+            <table class="form-table">
+                <tr>
+                    <th scope="row">Days to Post</th>
+                    <td>
+                        <fieldset>
+                            <?php foreach (SIMPLE_RSS_POSTER_DAYS as $day) : ?>
+                                <label style="display: inline-block; margin-right: 15px;">
+                                    <input type="checkbox" 
+                                           name="simple_rss_poster_post_days[<?php echo $day; ?>]" 
+                                           value="1"
+                                           <?php checked(!empty($post_days[$day]), true); ?>>
+                                    <?php echo $day; ?>
+                                </label>
+                            <?php endforeach; ?>
+                        </fieldset>
+                        <p class="description">
+                            Select which days to create digest posts. For a weekly digest, check only one day.<br>
+                            <a href="#" id="select-all-days">Select All</a> | <a href="#" id="select-none-days">Select None</a> | <a href="#" id="select-weekdays">Weekdays Only</a>
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="simple_rss_poster_post_time">Post Time</label></th>
+                    <td>
+                        <input type="time" 
+                               id="simple_rss_poster_post_time"
+                               name="simple_rss_poster_post_time" 
+                               value="<?php echo esc_attr($post_time); ?>">
+                        <p class="description">Time in your WordPress timezone (<?php echo esc_html(wp_timezone_string()); ?>)</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="simple_rss_poster_min_items">Minimum Items</label></th>
+                    <td>
+                        <input type="number" 
+                               id="simple_rss_poster_min_items"
+                               name="simple_rss_poster_min_items" 
+                               value="<?php echo esc_attr($min_items); ?>"
+                               min="0"
+                               max="50"
+                               style="width: 70px;">
+                        <p class="description">Skip posting if fewer than this many new items. Set to 0 to always post.</p>
+                    </td>
+                </tr>
+            </table>
+            
             <h2>Link Formatting</h2>
             <table class="form-table">
                 <tr>
@@ -295,6 +379,28 @@ function simple_rss_poster_settings_page() {
                             <option value="link_only" <?php selected($link_format, 'link_only'); ?>>Link only (just Article Title linked)</option>
                         </select>
                         <p class="description">How each link item should be formatted in the post.</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="simple_rss_poster_post_header">Post Header</label></th>
+                    <td>
+                        <input type="text" 
+                               id="simple_rss_poster_post_header"
+                               name="simple_rss_poster_post_header" 
+                               value="<?php echo esc_attr($post_header); ?>" 
+                               class="large-text">
+                        <p class="description">Optional text to appear before the list of links. HTML allowed.</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="simple_rss_poster_post_footer">Post Footer</label></th>
+                    <td>
+                        <input type="text" 
+                               id="simple_rss_poster_post_footer"
+                               name="simple_rss_poster_post_footer" 
+                               value="<?php echo esc_attr($post_footer); ?>" 
+                               class="large-text">
+                        <p class="description">Optional text to appear after the list of links. HTML allowed.</p>
                     </td>
                 </tr>
             </table>
@@ -409,10 +515,34 @@ function simple_rss_poster_settings_page() {
         var ajaxNonce = '<?php echo esc_js($ajax_nonce); ?>';
         var debounceTimer;
         
+        // Day selection helpers
+        $('#select-all-days').on('click', function(e) {
+            e.preventDefault();
+            $('input[name^="simple_rss_poster_post_days"]').prop('checked', true);
+        });
+        
+        $('#select-none-days').on('click', function(e) {
+            e.preventDefault();
+            $('input[name^="simple_rss_poster_post_days"]').prop('checked', false);
+        });
+        
+        $('#select-weekdays').on('click', function(e) {
+            e.preventDefault();
+            $('input[name^="simple_rss_poster_post_days"]').prop('checked', false);
+            $('input[name="simple_rss_poster_post_days[Monday]"]').prop('checked', true);
+            $('input[name="simple_rss_poster_post_days[Tuesday]"]').prop('checked', true);
+            $('input[name="simple_rss_poster_post_days[Wednesday]"]').prop('checked', true);
+            $('input[name="simple_rss_poster_post_days[Thursday]"]').prop('checked', true);
+            $('input[name="simple_rss_poster_post_days[Friday]"]').prop('checked', true);
+        });
+        
         function getPreview() {
             var feedUrl = $('#simple_rss_poster_feed_url').val();
             var postTitle = $('#simple_rss_poster_post_title').val();
             var linkFormat = $('#simple_rss_poster_link_format').val();
+            var postHeader = $('#simple_rss_poster_post_header').val();
+            var postFooter = $('#simple_rss_poster_post_footer').val();
+            var minItems = $('#simple_rss_poster_min_items').val();
             var fullReplacements = $('#simple_rss_poster_full_replacements').val();
             var titleReplacements = $('#simple_rss_poster_title_replacements').val();
             var autoStrip = $('#simple_rss_poster_auto_strip_suspicious').is(':checked') ? 1 : 0;
@@ -430,6 +560,9 @@ function simple_rss_poster_settings_page() {
                 feed_url: feedUrl,
                 post_title: postTitle,
                 link_format: linkFormat,
+                post_header: postHeader,
+                post_footer: postFooter,
+                min_items: minItems,
                 full_replacements: fullReplacements,
                 title_replacements: titleReplacements,
                 auto_strip: autoStrip
@@ -445,7 +578,7 @@ function simple_rss_poster_settings_page() {
         }
         
         // Debounced preview on input change
-        $('#simple_rss_poster_feed_url, #simple_rss_poster_post_title, #simple_rss_poster_full_replacements, #simple_rss_poster_title_replacements').on('input change', function() {
+        $('#simple_rss_poster_feed_url, #simple_rss_poster_post_title, #simple_rss_poster_post_header, #simple_rss_poster_post_footer, #simple_rss_poster_full_replacements, #simple_rss_poster_title_replacements, #simple_rss_poster_min_items').on('input change', function() {
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(getPreview, 500);
         });
@@ -468,9 +601,6 @@ function simple_rss_poster_settings_page() {
 
 /**
  * Parse replacement rules from textarea into an array.
- * 
- * @param string $replacements_text Raw text from settings
- * @return array Associative array of find => replace
  */
 function simple_rss_poster_parse_replacements($replacements_text) {
     $rules = [];
@@ -487,7 +617,6 @@ function simple_rss_poster_parse_replacements($replacements_text) {
             continue;
         }
         
-        // Split on => separator
         $parts = explode('=>', $line, 2);
         if (count($parts) >= 1) {
             $old_value = trim($parts[0]);
@@ -504,17 +633,12 @@ function simple_rss_poster_parse_replacements($replacements_text) {
 
 /**
  * Check if a prefix looks suspicious (like a hostname or URL fragment).
- * 
- * @param string $prefix The prefix to check
- * @return bool True if the prefix looks suspicious
  */
 function simple_rss_poster_is_suspicious_prefix($prefix) {
-    // Contains dots but no spaces - likely a hostname
     if (strpos($prefix, '.') !== false && strpos($prefix, ' ') === false) {
         return true;
     }
     
-    // Looks like a URL path or technical identifier
     if (preg_match('/^[a-z0-9._-]+$/i', $prefix) && strpos($prefix, '.') !== false) {
         return true;
     }
@@ -524,22 +648,15 @@ function simple_rss_poster_is_suspicious_prefix($prefix) {
 
 /**
  * Clean and process a single title.
- * 
- * @param string $raw_title The raw title from the feed
- * @param array $full_replacements Full string replacement rules
- * @param array $prefix_replacements Prefix replacement rules
- * @param bool $auto_strip Whether to auto-strip suspicious prefixes
- * @return array|null Array with 'prefix' and 'title' keys, or null if title should be skipped
  */
 function simple_rss_poster_clean_title($raw_title, $full_replacements = [], $prefix_replacements = [], $auto_strip = false) {
     // Step 1: Decode HTML entities
     $title = html_entity_decode($raw_title, ENT_QUOTES | ENT_HTML5, 'UTF-8');
     
-    // Step 2: Normalize whitespace (including non-breaking spaces)
+    // Step 2: Normalize whitespace
     $title = preg_replace('/[\s\x{00A0}]+/u', ' ', $title);
     $title = trim($title);
     
-    // Skip if empty after cleaning
     if (empty($title)) {
         return null;
     }
@@ -549,13 +666,11 @@ function simple_rss_poster_clean_title($raw_title, $full_replacements = [], $pre
         if (strpos($title, $find) !== false) {
             $title = str_replace($find, $replace, $title);
             $title = trim($title);
-            // Clean up any leftover ": " at the start
             $title = preg_replace('/^:\s*/', '', $title);
             $title = trim($title);
         }
     }
     
-    // Skip if empty after full replacements
     if (empty($title)) {
         return null;
     }
@@ -574,20 +689,17 @@ function simple_rss_poster_clean_title($raw_title, $full_replacements = [], $pre
             $new_prefix = $prefix_replacements[$prefix];
             
             if (empty($new_prefix)) {
-                // Empty replacement = strip prefix entirely
                 $prefix = '';
             } else {
-                // Replace with new prefix
                 $prefix = $new_prefix;
             }
         }
-        // Step 6: Check for suspicious prefix (if auto-strip enabled)
+        // Step 6: Check for suspicious prefix
         elseif ($auto_strip && simple_rss_poster_is_suspicious_prefix($prefix)) {
             $prefix = '';
         }
     }
     
-    // Final trim and empty check
     $article_title = trim($article_title);
     $prefix = trim($prefix);
     
@@ -603,12 +715,6 @@ function simple_rss_poster_clean_title($raw_title, $full_replacements = [], $pre
 
 /**
  * Format a link item based on the selected format.
- * 
- * @param string $prefix The site name prefix
- * @param string $title The article title
- * @param string $link The URL
- * @param string $format The format style (full_link, bold_prefix, link_only)
- * @return string Formatted HTML
  */
 function simple_rss_poster_format_link($prefix, $title, $link, $format = 'full_link') {
     $escaped_title = esc_html($title);
@@ -664,12 +770,6 @@ function simple_rss_poster_format_link($prefix, $title, $link, $format = 'full_l
 
 /**
  * Process feed items and return new (unposted) items.
- * 
- * @param array $rss_items SimplePie items from the feed
- * @param array $full_replacements Full string replacement rules
- * @param array $prefix_replacements Prefix replacement rules
- * @param bool $auto_strip Whether to auto-strip suspicious prefixes
- * @return array Array with 'items' (formatted) and 'links' (for tracking)
  */
 function simple_rss_poster_process_feed_items($rss_items, $full_replacements = [], $prefix_replacements = [], $auto_strip = false) {
     $posted_links = get_option('simple_rss_poster_posted_links', []);
@@ -680,12 +780,10 @@ function simple_rss_poster_process_feed_items($rss_items, $full_replacements = [
     foreach ($rss_items as $item) {
         $link = esc_url($item->get_permalink());
         
-        // Skip if we've already posted this link
         if (in_array($link, $posted_links, true)) {
             continue;
         }
 
-        // Clean the title
         $cleaned = simple_rss_poster_clean_title(
             $item->get_title(),
             $full_replacements,
@@ -693,7 +791,6 @@ function simple_rss_poster_process_feed_items($rss_items, $full_replacements = [
             $auto_strip
         );
         
-        // Skip if title is empty/invalid after cleaning
         if ($cleaned === null) {
             continue;
         }
@@ -706,9 +803,8 @@ function simple_rss_poster_process_feed_items($rss_items, $full_replacements = [
         $new_links[] = $link;
     }
 
-    // Sort alphabetically by title (case-insensitive)
+    // Sort alphabetically
     usort($new_items, function($a, $b) {
-        // Sort by prefix first if both have one, otherwise by title
         $a_sort = !empty($a['prefix']) ? $a['prefix'] . ': ' . $a['title'] : $a['title'];
         $b_sort = !empty($b['prefix']) ? $b['prefix'] . ': ' . $b['title'] : $b['title'];
         return strcasecmp($a_sort, $b_sort);
@@ -722,10 +818,6 @@ function simple_rss_poster_process_feed_items($rss_items, $full_replacements = [
 
 /**
  * Prune the posted links array to prevent unbounded growth.
- * 
- * @param array $links Current array of posted links
- * @param array $new_links New links to add
- * @return array Pruned array of links
  */
 function simple_rss_poster_prune_links($links, $new_links) {
     $combined = array_merge($links, $new_links);
@@ -746,13 +838,11 @@ function simple_rss_poster_prune_links($links, $new_links) {
  * AJAX Preview Handler
  */
 function simple_rss_poster_ajax_preview() {
-    // Verify nonce
     if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'simple_rss_poster_ajax_nonce')) {
         wp_send_json_error('Security check failed. Please refresh the page and try again.');
         return;
     }
     
-    // Check permissions
     if (!current_user_can('manage_options')) {
         wp_send_json_error('Permission denied.');
         return;
@@ -761,6 +851,9 @@ function simple_rss_poster_ajax_preview() {
     $feed_url = isset($_POST['feed_url']) ? esc_url_raw($_POST['feed_url']) : '';
     $post_title = isset($_POST['post_title']) ? sanitize_text_field($_POST['post_title']) : 'Latest Links';
     $link_format = isset($_POST['link_format']) ? sanitize_text_field($_POST['link_format']) : 'full_link';
+    $post_header = isset($_POST['post_header']) ? wp_kses_post($_POST['post_header']) : '';
+    $post_footer = isset($_POST['post_footer']) ? wp_kses_post($_POST['post_footer']) : '';
+    $min_items = isset($_POST['min_items']) ? absint($_POST['min_items']) : 1;
     $full_replacements_raw = isset($_POST['full_replacements']) ? sanitize_textarea_field($_POST['full_replacements']) : '';
     $title_replacements_raw = isset($_POST['title_replacements']) ? sanitize_textarea_field($_POST['title_replacements']) : '';
     $auto_strip = isset($_POST['auto_strip']) && $_POST['auto_strip'] === '1';
@@ -770,7 +863,6 @@ function simple_rss_poster_ajax_preview() {
         return;
     }
 
-    // Parse replacement rules
     $full_replacements = simple_rss_poster_parse_replacements($full_replacements_raw);
     $prefix_replacements = simple_rss_poster_parse_replacements($title_replacements_raw);
 
@@ -789,13 +881,30 @@ function simple_rss_poster_ajax_preview() {
         $auto_strip
     );
     
-    if (empty($data['items'])) {
+    $item_count = count($data['items']);
+    
+    if ($item_count === 0) {
         wp_send_json_success('<p><em>No new items to post. All feed items have already been posted.</em></p>');
         return;
     }
     
-    $output = '<h3 style="margin-top: 0;">' . esc_html($post_title) . ' - ' . date_i18n('F j, Y') . '</h3>';
-    $output .= '<p><strong>' . count($data['items']) . ' new item(s) ready to post:</strong></p>';
+    // Check minimum items threshold
+    if ($item_count < $min_items) {
+        wp_send_json_success(sprintf(
+            '<p><em>Only %d new item(s) found, but minimum is set to %d. Post would be skipped.</em></p>',
+            $item_count,
+            $min_items
+        ));
+        return;
+    }
+    
+    $output = '<h3 style="margin-top: 0;">' . esc_html($post_title) . ' - ' . wp_date('F j, Y') . '</h3>';
+    
+    if (!empty($post_header)) {
+        $output .= '<p>' . wp_kses_post($post_header) . '</p>';
+    }
+    
+    $output .= '<p><strong>' . $item_count . ' new item(s) ready to post:</strong></p>';
     $output .= '<ul style="margin-left: 20px;">';
     
     foreach ($data['items'] as $item) {
@@ -808,6 +917,10 @@ function simple_rss_poster_ajax_preview() {
     }
     
     $output .= '</ul>';
+    
+    if (!empty($post_footer)) {
+        $output .= '<p>' . wp_kses_post($post_footer) . '</p>';
+    }
     
     wp_send_json_success($output);
 }
@@ -842,7 +955,7 @@ function simple_rss_poster_handle_manual_post() {
         add_settings_error(
             'simple_rss_poster_messages',
             'no_items',
-            'No new items to post.',
+            'No new items to post (or below minimum threshold).',
             'warning'
         );
     } else {
@@ -898,9 +1011,6 @@ add_action('admin_init', 'simple_rss_poster_handle_reset');
 
 /**
  * Core Posting Engine
- * 
- * @param string $trigger Source of the post request ('manual', 'scheduled')
- * @return int|false|WP_Error Post ID on success, false if no items, WP_Error on failure
  */
 function simple_rss_poster_execute_post($trigger = 'scheduled') {
     $url = get_option('simple_rss_poster_feed_url');
@@ -908,6 +1018,9 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
     $category = get_option('simple_rss_poster_post_category', 0);
     $post_status = get_option('simple_rss_poster_post_status', 'publish');
     $link_format = get_option('simple_rss_poster_link_format', 'full_link');
+    $min_items = get_option('simple_rss_poster_min_items', 1);
+    $post_header = get_option('simple_rss_poster_post_header', '');
+    $post_footer = get_option('simple_rss_poster_post_footer', '');
     $full_replacements_raw = get_option('simple_rss_poster_full_replacements', '');
     $title_replacements_raw = get_option('simple_rss_poster_title_replacements', '');
     $auto_strip = get_option('simple_rss_poster_auto_strip_suspicious', false);
@@ -918,7 +1031,6 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
         return $error;
     }
     
-    // Parse replacement rules
     $full_replacements = simple_rss_poster_parse_replacements($full_replacements_raw);
     $prefix_replacements = simple_rss_poster_parse_replacements($title_replacements_raw);
     
@@ -937,13 +1049,27 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
         $auto_strip
     );
     
-    if (empty($data['items'])) {
+    $item_count = count($data['items']);
+    
+    if ($item_count === 0) {
         simple_rss_poster_log_status($trigger, null, 0);
+        return false;
+    }
+    
+    // Check minimum items threshold
+    if ($item_count < $min_items) {
+        simple_rss_poster_log_status($trigger, null, $item_count, null, $post_status, $min_items);
         return false;
     }
 
     // Build post content
-    $content = '<ul>';
+    $content = '';
+    
+    if (!empty($post_header)) {
+        $content .= '<p>' . wp_kses_post($post_header) . '</p>' . "\n";
+    }
+    
+    $content .= '<ul>';
     foreach ($data['items'] as $item) {
         $content .= '<li>' . simple_rss_poster_format_link(
             $item['prefix'],
@@ -953,6 +1079,10 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
         ) . '</li>';
     }
     $content .= '</ul>';
+    
+    if (!empty($post_footer)) {
+        $content .= "\n" . '<p>' . wp_kses_post($post_footer) . '</p>';
+    }
 
     // Validate category exists
     $post_category = [];
@@ -978,7 +1108,7 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
     $updated_links = simple_rss_poster_prune_links($current_links, $data['links']);
     update_option('simple_rss_poster_posted_links', $updated_links);
     
-    simple_rss_poster_log_status($trigger, null, count($data['items']), $post_id, $post_status);
+    simple_rss_poster_log_status($trigger, null, $item_count, $post_id, $post_status);
     
     return $post_id;
 }
@@ -986,7 +1116,7 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
 /**
  * Log status message for admin display
  */
-function simple_rss_poster_log_status($trigger, $error = null, $item_count = 0, $post_id = null, $post_status = 'publish') {
+function simple_rss_poster_log_status($trigger, $error = null, $item_count = 0, $post_id = null, $post_status = 'publish', $min_items = null) {
     $timestamp = wp_date('Y-m-d H:i:s');
     $trigger_label = ($trigger === 'manual') ? 'Manual' : 'Scheduled';
     $status_label = ($post_status === 'draft') ? 'draft' : 'post';
@@ -995,6 +1125,8 @@ function simple_rss_poster_log_status($trigger, $error = null, $item_count = 0, 
         $message = sprintf('[%s] %s post failed: %s', $timestamp, $trigger_label, $error->get_error_message());
     } elseif ($item_count === 0) {
         $message = sprintf('[%s] %s run: No new items to post.', $timestamp, $trigger_label);
+    } elseif ($min_items !== null && $item_count < $min_items) {
+        $message = sprintf('[%s] %s run: Only %d item(s) found, minimum is %d. Skipped.', $timestamp, $trigger_label, $item_count, $min_items);
     } else {
         $message = sprintf('[%s] %s %s created with %d items (Post ID: %d)', $timestamp, $trigger_label, $status_label, $item_count, $post_id);
     }
@@ -1008,29 +1140,52 @@ function simple_rss_poster_log_status($trigger, $error = null, $item_count = 0, 
 
 /**
  * Calculate the next scheduled post time based on settings.
- * 
- * @return int Unix timestamp for next scheduled run
  */
 function simple_rss_poster_get_next_scheduled_time() {
     $post_time = get_option('simple_rss_poster_post_time', '00:00');
+    $post_days = get_option('simple_rss_poster_post_days', array_fill_keys(SIMPLE_RSS_POSTER_DAYS, 1));
+    
     $time_parts = explode(':', $post_time);
     $hour = intval($time_parts[0]);
     $minute = intval($time_parts[1]);
     
-    // Get current time in WP timezone
+    // Check if any days are selected
+    $any_day_selected = false;
+    foreach ($post_days as $day => $selected) {
+        if ($selected) {
+            $any_day_selected = true;
+            break;
+        }
+    }
+    
+    if (!$any_day_selected) {
+        return false; // No days selected, don't schedule
+    }
+    
     $wp_timezone = wp_timezone();
     $now = new DateTime('now', $wp_timezone);
     
-    // Create target time for today in WP timezone
+    // Start checking from today
     $target = new DateTime('now', $wp_timezone);
     $target->setTime($hour, $minute, 0);
     
-    // If target time has passed today, schedule for tomorrow
+    // If today's time has passed, start from tomorrow
     if ($target <= $now) {
         $target->modify('+1 day');
     }
     
-    return $target->getTimestamp();
+    // Find the next selected day (up to 7 days out)
+    for ($i = 0; $i < 7; $i++) {
+        $day_name = $target->format('l'); // Full day name (e.g., "Monday")
+        
+        if (!empty($post_days[$day_name])) {
+            return $target->getTimestamp();
+        }
+        
+        $target->modify('+1 day');
+    }
+    
+    return false; // No matching day found
 }
 
 /**
@@ -1043,9 +1198,11 @@ function simple_rss_poster_schedule_next_post() {
         wp_unschedule_event($timestamp, SIMPLE_RSS_POSTER_CRON_HOOK);
     }
     
-    // Schedule for the next occurrence of the configured time
+    // Schedule for the next occurrence of the configured time and day
     $next_time = simple_rss_poster_get_next_scheduled_time();
-    wp_schedule_single_event($next_time, SIMPLE_RSS_POSTER_CRON_HOOK);
+    if ($next_time) {
+        wp_schedule_single_event($next_time, SIMPLE_RSS_POSTER_CRON_HOOK);
+    }
 }
 
 /**
@@ -1060,12 +1217,12 @@ add_action('wp', 'simple_rss_poster_maybe_schedule');
 add_action('admin_init', 'simple_rss_poster_maybe_schedule');
 
 /**
- * Cron callback - execute post and reschedule for tomorrow.
+ * Cron callback - execute post and reschedule.
  */
 function simple_rss_poster_cron_callback() {
     simple_rss_poster_execute_post('scheduled');
     
-    // Reschedule for tomorrow at the same time
+    // Reschedule for the next selected day
     simple_rss_poster_schedule_next_post();
 }
 add_action(SIMPLE_RSS_POSTER_CRON_HOOK, 'simple_rss_poster_cron_callback');
@@ -1078,18 +1235,20 @@ add_action(SIMPLE_RSS_POSTER_CRON_HOOK, 'simple_rss_poster_cron_callback');
  * Plugin activation
  */
 function simple_rss_poster_activate() {
-    // Initialize options if they don't exist
     add_option('simple_rss_poster_posted_links', []);
     add_option('simple_rss_poster_post_time', '00:00');
+    add_option('simple_rss_poster_post_days', array_fill_keys(SIMPLE_RSS_POSTER_DAYS, 1));
     add_option('simple_rss_poster_post_title', 'Latest Links');
     add_option('simple_rss_poster_post_category', 0);
     add_option('simple_rss_poster_post_status', 'publish');
     add_option('simple_rss_poster_link_format', 'full_link');
+    add_option('simple_rss_poster_min_items', 1);
+    add_option('simple_rss_poster_post_header', '');
+    add_option('simple_rss_poster_post_footer', '');
     add_option('simple_rss_poster_full_replacements', '');
     add_option('simple_rss_poster_title_replacements', '');
     add_option('simple_rss_poster_auto_strip_suspicious', false);
     
-    // Schedule the first cron run
     simple_rss_poster_schedule_next_post();
 }
 register_activation_hook(__FILE__, 'simple_rss_poster_activate');
@@ -1098,7 +1257,6 @@ register_activation_hook(__FILE__, 'simple_rss_poster_activate');
  * Plugin deactivation
  */
 function simple_rss_poster_deactivate() {
-    // Clear scheduled events
     $timestamp = wp_next_scheduled(SIMPLE_RSS_POSTER_CRON_HOOK);
     if ($timestamp) {
         wp_unschedule_event($timestamp, SIMPLE_RSS_POSTER_CRON_HOOK);
