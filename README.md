@@ -1,12 +1,14 @@
 # Simple RSS Feed Poster
 
-A WordPress plugin that automatically creates daily digest posts from an RSS feed. Perfect for sharing bookmarked links, curated content, or any RSS-based link collection.
+A WordPress plugin that automatically creates daily or weekly digest posts from an RSS feed. Perfect for sharing bookmarked links, curated content, or any RSS-based link collection.
 
 ## Features
 
-- **Scheduled daily posting** at a configurable time in your WordPress timezone
+- **Flexible scheduling**: Choose specific days of the week and time to post (daily, weekdays only, weekly, etc.)
 - **Alphabetical sorting** of links for easy scanning
 - **Duplicate detection** to prevent reposting (tracks last 500 links)
+- **Minimum items threshold**: Skip posting if not enough new links
+- **Post header and footer**: Add custom intro/outro text to each digest
 - **Flexible link formatting**:
   - Full link (Site Name: Article Title all linked)
   - Bold prefix (Site Name bold, Article Title linked)
@@ -36,9 +38,14 @@ Or zip the folder and upload via **Plugins → Add New → Upload Plugin**.
 
 - **RSS Feed URL**: The feed to pull links from
 - **Base Post Title**: Title prefix for posts (date is appended automatically)
-- **Daily Post Time**: When to create the daily post (uses your WordPress timezone)
 - **Post Category**: Which category to assign posts to
 - **Post Status**: Publish immediately or save as draft for review
+
+### Schedule
+
+- **Days to Post**: Select which days of the week to create digests. For a weekly digest, check only one day (e.g., Friday). Quick links for "Select All", "Select None", and "Weekdays Only".
+- **Post Time**: What time to create the post (uses your WordPress timezone)
+- **Minimum Items**: Skip posting if fewer than this many new items. Set to 0 to always post.
 
 ### Link Formatting
 
@@ -49,6 +56,10 @@ Choose how each link appears in your digest:
 | Full link | [Site Name: Article Title](url) |
 | Bold prefix | **Site Name**: [Article Title](url) |
 | Link only | [Article Title](url) |
+
+**Post Header**: Optional text that appears before the list of links (HTML allowed). Example: "Here are some interesting links I found today:"
+
+**Post Footer**: Optional text that appears after the list of links (HTML allowed). Example: "Found something interesting? [Send it my way](mailto:you@example.com)!"
 
 ### Title Cleanup
 
@@ -82,7 +93,7 @@ This plugin was designed for a workflow where:
 
 1. You star articles in [Feedbin](https://feedbin.com/)
 2. An automation (IFTTT/Zapier) saves starred items to [Pinboard](https://pinboard.in/) with the format `Site Name: Article Title`
-3. This plugin pulls from your Pinboard RSS feed and creates a daily digest post
+3. This plugin pulls from your Pinboard RSS feed and creates a daily/weekly digest post
 
 The title cleanup features help normalize inconsistent feed names from various sources.
 
@@ -101,6 +112,11 @@ define('DISABLE_WP_CRON', true);
 ```
 
 ## Changelog
+
+### 2.3.0
+- Added: Post days selection (choose specific days for weekly/custom schedules)
+- Added: Minimum items threshold (skip posting if not enough new links)
+- Added: Post header and footer text options
 
 ### 2.2.0
 - Added: Full string replacements for complex site names with colons
@@ -132,4 +148,4 @@ GPL v2 or later
 
 ## Author
 
-Ryan Gallagher
+Your Name
