@@ -2,12 +2,17 @@
 /*
 Plugin Name: Simple RSS Feed Poster
 Description: Fetches and posts new links from a single RSS feed, sorted alphabetically, with scheduled posting and preview.
-Version: 2.1.0
+Version: 2.2.0
 Author: Ryan Gallagher
 */
 
 /*
 Changelog:
+2.2.0 - Added: Full string replacements (for complex site names with colons)
+        Added: Post status setting (publish or draft)
+        Added: Link format setting (full link, bold prefix, or link only)
+        Fixed: Scheduled time display now shows correct timezone
+
 2.1.0 - Added: Title prefix replacement rules (define custom mappings for bad feed names)
         Added: Option to auto-strip suspicious prefixes (hostnames, URL fragments)
         Added: HTML entity decoding and whitespace normalization for cleaner titles
@@ -53,7 +58,7 @@ function simple_rss_poster_sanitize_post_time($input) {
             __('Invalid post time. Please use HH:MM format (e.g., 14:30).', 'simple-rss-poster'),
             'error'
         );
-        return get_option('simple_rss_poster_post_time', '00:00'); // Return existing value on error
+        return get_option('simple_rss_poster_post_time', '00:00');
     }
     return $input;
 }
@@ -76,22 +81,36 @@ function simple_rss_poster_sanitize_category($input) {
 }
 
 /**
- * Sanitizes the title replacements textarea.
+ * Sanitizes textarea inputs (replacements).
  */
 function simple_rss_poster_sanitize_replacements($input) {
-    // Sanitize each line individually, preserve the structure
     $lines = explode("\n", $input);
     $clean_lines = [];
     
     foreach ($lines as $line) {
         $line = trim($line);
         if (!empty($line)) {
-            // Basic sanitization - allow the => separator and reasonable text
             $clean_lines[] = sanitize_text_field($line);
         }
     }
     
     return implode("\n", $clean_lines);
+}
+
+/**
+ * Sanitizes post status selection.
+ */
+function simple_rss_poster_sanitize_post_status($input) {
+    $allowed = ['publish', 'draft'];
+    return in_array($input, $allowed, true) ? $input : 'publish';
+}
+
+/**
+ * Sanitizes link format selection.
+ */
+function simple_rss_poster_sanitize_link_format($input) {
+    $allowed = ['full_link', 'bold_prefix', 'link_only'];
+    return in_array($input, $allowed, true) ? $input : 'full_link';
 }
 
 function simple_rss_poster_register_settings() {
@@ -109,6 +128,18 @@ function simple_rss_poster_register_settings() {
     register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_post_category', [
         'sanitize_callback' => 'simple_rss_poster_sanitize_category',
         'default' => 0
+    ]);
+    register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_post_status', [
+        'sanitize_callback' => 'simple_rss_poster_sanitize_post_status',
+        'default' => 'publish'
+    ]);
+    register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_link_format', [
+        'sanitize_callback' => 'simple_rss_poster_sanitize_link_format',
+        'default' => 'full_link'
+    ]);
+    register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_full_replacements', [
+        'sanitize_callback' => 'simple_rss_poster_sanitize_replacements',
+        'default' => ''
     ]);
     register_setting('simple_rss_poster_settings_group', 'simple_rss_poster_title_replacements', [
         'sanitize_callback' => 'simple_rss_poster_sanitize_replacements',
@@ -167,16 +198,19 @@ function simple_rss_poster_settings_page() {
     $post_title          = get_option('simple_rss_poster_post_title', 'Latest Links');
     $post_time           = get_option('simple_rss_poster_post_time', '00:00');
     $post_category       = get_option('simple_rss_poster_post_category', 0);
+    $post_status         = get_option('simple_rss_poster_post_status', 'publish');
+    $link_format         = get_option('simple_rss_poster_link_format', 'full_link');
+    $full_replacements   = get_option('simple_rss_poster_full_replacements', '');
     $title_replacements  = get_option('simple_rss_poster_title_replacements', '');
     $auto_strip          = get_option('simple_rss_poster_auto_strip_suspicious', false);
     $status              = get_option('simple_rss_poster_scheduled_post_status', '');
     $categories          = get_categories(['hide_empty' => false]);
     $tracked_count       = count(get_option('simple_rss_poster_posted_links', []));
 
-    // Get next scheduled run from WP-Cron
+    // Get next scheduled run from WP-Cron (fixed timezone display)
     $next_scheduled = wp_next_scheduled(SIMPLE_RSS_POSTER_CRON_HOOK);
     $next_run = $next_scheduled 
-        ? date_i18n('F j, Y @ g:i a', $next_scheduled) 
+        ? wp_date('F j, Y @ g:i a', $next_scheduled) 
         : 'Not scheduled - save settings to schedule';
 
     // Create nonce for AJAX
@@ -238,10 +272,50 @@ function simple_rss_poster_settings_page() {
                         </select>
                     </td>
                 </tr>
+                <tr>
+                    <th scope="row"><label for="simple_rss_poster_post_status">Post Status</label></th>
+                    <td>
+                        <select id="simple_rss_poster_post_status" name="simple_rss_poster_post_status">
+                            <option value="publish" <?php selected($post_status, 'publish'); ?>>Publish</option>
+                            <option value="draft" <?php selected($post_status, 'draft'); ?>>Draft</option>
+                        </select>
+                        <p class="description">Draft lets you review posts before publishing.</p>
+                    </td>
+                </tr>
+            </table>
+            
+            <h2>Link Formatting</h2>
+            <table class="form-table">
+                <tr>
+                    <th scope="row"><label for="simple_rss_poster_link_format">Link Format</label></th>
+                    <td>
+                        <select id="simple_rss_poster_link_format" name="simple_rss_poster_link_format">
+                            <option value="full_link" <?php selected($link_format, 'full_link'); ?>>Full link (Site Name: Article Title all linked)</option>
+                            <option value="bold_prefix" <?php selected($link_format, 'bold_prefix'); ?>>Bold prefix (Site Name bold, Article Title linked)</option>
+                            <option value="link_only" <?php selected($link_format, 'link_only'); ?>>Link only (just Article Title linked)</option>
+                        </select>
+                        <p class="description">How each link item should be formatted in the post.</p>
+                    </td>
+                </tr>
             </table>
             
             <h2>Title Cleanup</h2>
             <table class="form-table">
+                <tr>
+                    <th scope="row"><label for="simple_rss_poster_full_replacements">Full String Replacements</label></th>
+                    <td>
+                        <textarea id="simple_rss_poster_full_replacements"
+                                  name="simple_rss_poster_full_replacements"
+                                  rows="4"
+                                  class="large-text code"><?php echo esc_textarea($full_replacements); ?></textarea>
+                        <p class="description">
+                            One rule per line. Format: <code>Full String to Find => Replacement</code><br>
+                            Use this for site names that contain colons. Processed before prefix replacements.<br>
+                            Example:<br>
+                            <code>AFA: Animation For Adults : Animation News, Reviews, Articles, Podcasts and More => Animation for Adults</code>
+                        </p>
+                    </td>
+                </tr>
                 <tr>
                     <th scope="row"><label for="simple_rss_poster_title_replacements">Prefix Replacements</label></th>
                     <td>
@@ -251,7 +325,7 @@ function simple_rss_poster_settings_page() {
                                   class="large-text code"><?php echo esc_textarea($title_replacements); ?></textarea>
                         <p class="description">
                             One rule per line. Format: <code>Old Prefix => New Prefix</code><br>
-                            Leave the right side empty to remove the prefix entirely.<br>
+                            Matches the prefix (text before the first colon). Leave the right side empty to remove the prefix entirely.<br>
                             Examples:<br>
                             <code>rss.livelink.threads-in-node => Microsoft 365 Blog</code><br>
                             <code>(No title) =></code>
@@ -338,6 +412,8 @@ function simple_rss_poster_settings_page() {
         function getPreview() {
             var feedUrl = $('#simple_rss_poster_feed_url').val();
             var postTitle = $('#simple_rss_poster_post_title').val();
+            var linkFormat = $('#simple_rss_poster_link_format').val();
+            var fullReplacements = $('#simple_rss_poster_full_replacements').val();
             var titleReplacements = $('#simple_rss_poster_title_replacements').val();
             var autoStrip = $('#simple_rss_poster_auto_strip_suspicious').is(':checked') ? 1 : 0;
             
@@ -353,6 +429,8 @@ function simple_rss_poster_settings_page() {
                 nonce: ajaxNonce,
                 feed_url: feedUrl,
                 post_title: postTitle,
+                link_format: linkFormat,
+                full_replacements: fullReplacements,
                 title_replacements: titleReplacements,
                 auto_strip: autoStrip
             }, function(response) {
@@ -367,13 +445,13 @@ function simple_rss_poster_settings_page() {
         }
         
         // Debounced preview on input change
-        $('#simple_rss_poster_feed_url, #simple_rss_poster_post_title, #simple_rss_poster_title_replacements').on('input change', function() {
+        $('#simple_rss_poster_feed_url, #simple_rss_poster_post_title, #simple_rss_poster_full_replacements, #simple_rss_poster_title_replacements').on('input change', function() {
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(getPreview, 500);
         });
         
-        // Immediate preview on checkbox change
-        $('#simple_rss_poster_auto_strip_suspicious').on('change', function() {
+        // Immediate preview on select/checkbox change
+        $('#simple_rss_poster_link_format, #simple_rss_poster_auto_strip_suspicious').on('change', function() {
             getPreview();
         });
         
@@ -389,10 +467,10 @@ function simple_rss_poster_settings_page() {
 //------------------------------------------------------------------------------
 
 /**
- * Parse the title replacements setting into an array.
+ * Parse replacement rules from textarea into an array.
  * 
  * @param string $replacements_text Raw text from settings
- * @return array Associative array of old_prefix => new_prefix
+ * @return array Associative array of find => replace
  */
 function simple_rss_poster_parse_replacements($replacements_text) {
     $rules = [];
@@ -412,11 +490,11 @@ function simple_rss_poster_parse_replacements($replacements_text) {
         // Split on => separator
         $parts = explode('=>', $line, 2);
         if (count($parts) >= 1) {
-            $old_prefix = trim($parts[0]);
-            $new_prefix = isset($parts[1]) ? trim($parts[1]) : '';
+            $old_value = trim($parts[0]);
+            $new_value = isset($parts[1]) ? trim($parts[1]) : '';
             
-            if (!empty($old_prefix)) {
-                $rules[$old_prefix] = $new_prefix;
+            if (!empty($old_value)) {
+                $rules[$old_value] = $new_value;
             }
         }
     }
@@ -448,11 +526,12 @@ function simple_rss_poster_is_suspicious_prefix($prefix) {
  * Clean and process a single title.
  * 
  * @param string $raw_title The raw title from the feed
- * @param array $replacements Replacement rules array
+ * @param array $full_replacements Full string replacement rules
+ * @param array $prefix_replacements Prefix replacement rules
  * @param bool $auto_strip Whether to auto-strip suspicious prefixes
- * @return string|null Cleaned title, or null if title should be skipped
+ * @return array|null Array with 'prefix' and 'title' keys, or null if title should be skipped
  */
-function simple_rss_poster_clean_title($raw_title, $replacements = [], $auto_strip = false) {
+function simple_rss_poster_clean_title($raw_title, $full_replacements = [], $prefix_replacements = [], $auto_strip = false) {
     // Step 1: Decode HTML entities
     $title = html_entity_decode($raw_title, ENT_QUOTES | ENT_HTML5, 'UTF-8');
     
@@ -465,35 +544,118 @@ function simple_rss_poster_clean_title($raw_title, $replacements = [], $auto_str
         return null;
     }
     
-    // Step 3: Split on first ": " to get prefix and article title
+    // Step 3: Apply full string replacements first
+    foreach ($full_replacements as $find => $replace) {
+        if (strpos($title, $find) !== false) {
+            $title = str_replace($find, $replace, $title);
+            $title = trim($title);
+            // Clean up any leftover ": " at the start
+            $title = preg_replace('/^:\s*/', '', $title);
+            $title = trim($title);
+        }
+    }
+    
+    // Skip if empty after full replacements
+    if (empty($title)) {
+        return null;
+    }
+    
+    // Step 4: Split on first ": " to get prefix and article title
     $separator_pos = strpos($title, ': ');
+    $prefix = '';
+    $article_title = $title;
     
     if ($separator_pos !== false) {
         $prefix = substr($title, 0, $separator_pos);
         $article_title = substr($title, $separator_pos + 2);
         
-        // Step 4: Check for explicit replacement rule
-        if (isset($replacements[$prefix])) {
-            $new_prefix = $replacements[$prefix];
+        // Step 5: Check for prefix replacement rule
+        if (isset($prefix_replacements[$prefix])) {
+            $new_prefix = $prefix_replacements[$prefix];
             
             if (empty($new_prefix)) {
                 // Empty replacement = strip prefix entirely
-                $title = $article_title;
+                $prefix = '';
             } else {
                 // Replace with new prefix
-                $title = $new_prefix . ': ' . $article_title;
+                $prefix = $new_prefix;
             }
         }
-        // Step 5: Check for suspicious prefix (if auto-strip enabled)
+        // Step 6: Check for suspicious prefix (if auto-strip enabled)
         elseif ($auto_strip && simple_rss_poster_is_suspicious_prefix($prefix)) {
-            $title = $article_title;
+            $prefix = '';
         }
     }
     
     // Final trim and empty check
-    $title = trim($title);
+    $article_title = trim($article_title);
+    $prefix = trim($prefix);
     
-    return !empty($title) ? $title : null;
+    if (empty($article_title)) {
+        return null;
+    }
+    
+    return [
+        'prefix' => $prefix,
+        'title'  => $article_title
+    ];
+}
+
+/**
+ * Format a link item based on the selected format.
+ * 
+ * @param string $prefix The site name prefix
+ * @param string $title The article title
+ * @param string $link The URL
+ * @param string $format The format style (full_link, bold_prefix, link_only)
+ * @return string Formatted HTML
+ */
+function simple_rss_poster_format_link($prefix, $title, $link, $format = 'full_link') {
+    $escaped_title = esc_html($title);
+    $escaped_prefix = esc_html($prefix);
+    $escaped_link = esc_url($link);
+    
+    switch ($format) {
+        case 'bold_prefix':
+            if (!empty($prefix)) {
+                return sprintf(
+                    '<strong>%s</strong>: <a href="%s">%s</a>',
+                    $escaped_prefix,
+                    $escaped_link,
+                    $escaped_title
+                );
+            } else {
+                return sprintf(
+                    '<a href="%s">%s</a>',
+                    $escaped_link,
+                    $escaped_title
+                );
+            }
+            
+        case 'link_only':
+            return sprintf(
+                '<a href="%s">%s</a>',
+                $escaped_link,
+                $escaped_title
+            );
+            
+        case 'full_link':
+        default:
+            if (!empty($prefix)) {
+                return sprintf(
+                    '<a href="%s">%s: %s</a>',
+                    $escaped_link,
+                    $escaped_prefix,
+                    $escaped_title
+                );
+            } else {
+                return sprintf(
+                    '<a href="%s">%s</a>',
+                    $escaped_link,
+                    $escaped_title
+                );
+            }
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -504,11 +666,12 @@ function simple_rss_poster_clean_title($raw_title, $replacements = [], $auto_str
  * Process feed items and return new (unposted) items.
  * 
  * @param array $rss_items SimplePie items from the feed
- * @param array $replacements Title replacement rules
+ * @param array $full_replacements Full string replacement rules
+ * @param array $prefix_replacements Prefix replacement rules
  * @param bool $auto_strip Whether to auto-strip suspicious prefixes
  * @return array Array with 'items' (formatted) and 'links' (for tracking)
  */
-function simple_rss_poster_process_feed_items($rss_items, $replacements = [], $auto_strip = false) {
+function simple_rss_poster_process_feed_items($rss_items, $full_replacements = [], $prefix_replacements = [], $auto_strip = false) {
     $posted_links = get_option('simple_rss_poster_posted_links', []);
     
     $new_items = [];
@@ -523,27 +686,32 @@ function simple_rss_poster_process_feed_items($rss_items, $replacements = [], $a
         }
 
         // Clean the title
-        $clean_title = simple_rss_poster_clean_title(
+        $cleaned = simple_rss_poster_clean_title(
             $item->get_title(),
-            $replacements,
+            $full_replacements,
+            $prefix_replacements,
             $auto_strip
         );
         
         // Skip if title is empty/invalid after cleaning
-        if ($clean_title === null) {
+        if ($cleaned === null) {
             continue;
         }
 
         $new_items[] = [
-            'title' => esc_html($clean_title),
-            'link'  => $link
+            'prefix' => $cleaned['prefix'],
+            'title'  => $cleaned['title'],
+            'link'   => $link
         ];
         $new_links[] = $link;
     }
 
     // Sort alphabetically by title (case-insensitive)
     usort($new_items, function($a, $b) {
-        return strcasecmp($a['title'], $b['title']);
+        // Sort by prefix first if both have one, otherwise by title
+        $a_sort = !empty($a['prefix']) ? $a['prefix'] . ': ' . $a['title'] : $a['title'];
+        $b_sort = !empty($b['prefix']) ? $b['prefix'] . ': ' . $b['title'] : $b['title'];
+        return strcasecmp($a_sort, $b_sort);
     });
 
     return [
@@ -554,7 +722,6 @@ function simple_rss_poster_process_feed_items($rss_items, $replacements = [], $a
 
 /**
  * Prune the posted links array to prevent unbounded growth.
- * Keeps the most recent entries.
  * 
  * @param array $links Current array of posted links
  * @param array $new_links New links to add
@@ -564,7 +731,6 @@ function simple_rss_poster_prune_links($links, $new_links) {
     $combined = array_merge($links, $new_links);
     $combined = array_unique($combined);
     
-    // Keep only the most recent entries
     if (count($combined) > SIMPLE_RSS_POSTER_MAX_TRACKED_LINKS) {
         $combined = array_slice($combined, -SIMPLE_RSS_POSTER_MAX_TRACKED_LINKS);
     }
@@ -594,6 +760,8 @@ function simple_rss_poster_ajax_preview() {
     
     $feed_url = isset($_POST['feed_url']) ? esc_url_raw($_POST['feed_url']) : '';
     $post_title = isset($_POST['post_title']) ? sanitize_text_field($_POST['post_title']) : 'Latest Links';
+    $link_format = isset($_POST['link_format']) ? sanitize_text_field($_POST['link_format']) : 'full_link';
+    $full_replacements_raw = isset($_POST['full_replacements']) ? sanitize_textarea_field($_POST['full_replacements']) : '';
     $title_replacements_raw = isset($_POST['title_replacements']) ? sanitize_textarea_field($_POST['title_replacements']) : '';
     $auto_strip = isset($_POST['auto_strip']) && $_POST['auto_strip'] === '1';
     
@@ -603,7 +771,8 @@ function simple_rss_poster_ajax_preview() {
     }
 
     // Parse replacement rules
-    $replacements = simple_rss_poster_parse_replacements($title_replacements_raw);
+    $full_replacements = simple_rss_poster_parse_replacements($full_replacements_raw);
+    $prefix_replacements = simple_rss_poster_parse_replacements($title_replacements_raw);
 
     include_once(ABSPATH . WPINC . '/feed.php');
     
@@ -615,7 +784,8 @@ function simple_rss_poster_ajax_preview() {
 
     $data = simple_rss_poster_process_feed_items(
         $rss->get_items(0, SIMPLE_RSS_POSTER_FEED_ITEM_LIMIT),
-        $replacements,
+        $full_replacements,
+        $prefix_replacements,
         $auto_strip
     );
     
@@ -629,11 +799,12 @@ function simple_rss_poster_ajax_preview() {
     $output .= '<ul style="margin-left: 20px;">';
     
     foreach ($data['items'] as $item) {
-        $output .= sprintf(
-            '<li><a href="%s" target="_blank" rel="noopener">%s</a></li>',
-            esc_url($item['link']),
-            esc_html($item['title'])
-        );
+        $output .= '<li>' . simple_rss_poster_format_link(
+            $item['prefix'],
+            $item['title'],
+            $item['link'],
+            $link_format
+        ) . '</li>';
     }
     
     $output .= '</ul>';
@@ -675,10 +846,12 @@ function simple_rss_poster_handle_manual_post() {
             'warning'
         );
     } else {
+        $post_status = get_option('simple_rss_poster_post_status', 'publish');
+        $status_label = ($post_status === 'draft') ? 'Draft created' : 'Post published';
         add_settings_error(
             'simple_rss_poster_messages',
             'post_success',
-            'Post created successfully!',
+            $status_label . ' successfully!',
             'success'
         );
     }
@@ -707,7 +880,7 @@ function simple_rss_poster_handle_reset() {
     }
     
     delete_option('simple_rss_poster_posted_links');
-    update_option('simple_rss_poster_scheduled_post_status', 'History reset at ' . date_i18n('Y-m-d H:i:s'));
+    update_option('simple_rss_poster_scheduled_post_status', 'History reset at ' . wp_date('Y-m-d H:i:s'));
     
     add_settings_error(
         'simple_rss_poster_messages',
@@ -733,6 +906,9 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
     $url = get_option('simple_rss_poster_feed_url');
     $title = get_option('simple_rss_poster_post_title', 'Latest Links');
     $category = get_option('simple_rss_poster_post_category', 0);
+    $post_status = get_option('simple_rss_poster_post_status', 'publish');
+    $link_format = get_option('simple_rss_poster_link_format', 'full_link');
+    $full_replacements_raw = get_option('simple_rss_poster_full_replacements', '');
     $title_replacements_raw = get_option('simple_rss_poster_title_replacements', '');
     $auto_strip = get_option('simple_rss_poster_auto_strip_suspicious', false);
     
@@ -743,7 +919,8 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
     }
     
     // Parse replacement rules
-    $replacements = simple_rss_poster_parse_replacements($title_replacements_raw);
+    $full_replacements = simple_rss_poster_parse_replacements($full_replacements_raw);
+    $prefix_replacements = simple_rss_poster_parse_replacements($title_replacements_raw);
     
     include_once(ABSPATH . WPINC . '/feed.php');
     
@@ -755,7 +932,8 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
 
     $data = simple_rss_poster_process_feed_items(
         $rss->get_items(0, SIMPLE_RSS_POSTER_FEED_ITEM_LIMIT),
-        $replacements,
+        $full_replacements,
+        $prefix_replacements,
         $auto_strip
     );
     
@@ -767,11 +945,12 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
     // Build post content
     $content = '<ul>';
     foreach ($data['items'] as $item) {
-        $content .= sprintf(
-            '<li><a href="%s">%s</a></li>',
-            esc_url($item['link']),
-            esc_html($item['title'])
-        );
+        $content .= '<li>' . simple_rss_poster_format_link(
+            $item['prefix'],
+            $item['title'],
+            $item['link'],
+            $link_format
+        ) . '</li>';
     }
     $content .= '</ul>';
 
@@ -783,9 +962,9 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
 
     // Create the post
     $post_id = wp_insert_post([
-        'post_title'    => $title . ' - ' . date_i18n('F j, Y'),
+        'post_title'    => $title . ' - ' . wp_date('F j, Y'),
         'post_content'  => $content,
-        'post_status'   => 'publish',
+        'post_status'   => $post_status,
         'post_category' => $post_category
     ], true);
 
@@ -794,12 +973,12 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
         return $post_id;
     }
 
-    // Update tracking - prune old links to prevent unbounded growth
+    // Update tracking
     $current_links = get_option('simple_rss_poster_posted_links', []);
     $updated_links = simple_rss_poster_prune_links($current_links, $data['links']);
     update_option('simple_rss_poster_posted_links', $updated_links);
     
-    simple_rss_poster_log_status($trigger, null, count($data['items']), $post_id);
+    simple_rss_poster_log_status($trigger, null, count($data['items']), $post_id, $post_status);
     
     return $post_id;
 }
@@ -807,16 +986,17 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
 /**
  * Log status message for admin display
  */
-function simple_rss_poster_log_status($trigger, $error = null, $item_count = 0, $post_id = null) {
-    $timestamp = date_i18n('Y-m-d H:i:s');
+function simple_rss_poster_log_status($trigger, $error = null, $item_count = 0, $post_id = null, $post_status = 'publish') {
+    $timestamp = wp_date('Y-m-d H:i:s');
     $trigger_label = ($trigger === 'manual') ? 'Manual' : 'Scheduled';
+    $status_label = ($post_status === 'draft') ? 'draft' : 'post';
     
     if (is_wp_error($error)) {
         $message = sprintf('[%s] %s post failed: %s', $timestamp, $trigger_label, $error->get_error_message());
     } elseif ($item_count === 0) {
         $message = sprintf('[%s] %s run: No new items to post.', $timestamp, $trigger_label);
     } else {
-        $message = sprintf('[%s] %s post created with %d items (Post ID: %d)', $timestamp, $trigger_label, $item_count, $post_id);
+        $message = sprintf('[%s] %s %s created with %d items (Post ID: %d)', $timestamp, $trigger_label, $status_label, $item_count, $post_id);
     }
     
     update_option('simple_rss_poster_scheduled_post_status', $message);
@@ -837,11 +1017,11 @@ function simple_rss_poster_get_next_scheduled_time() {
     $hour = intval($time_parts[0]);
     $minute = intval($time_parts[1]);
     
-    // Get today's date in WP timezone
+    // Get current time in WP timezone
     $wp_timezone = wp_timezone();
     $now = new DateTime('now', $wp_timezone);
     
-    // Create target time for today
+    // Create target time for today in WP timezone
     $target = new DateTime('now', $wp_timezone);
     $target->setTime($hour, $minute, 0);
     
@@ -903,6 +1083,9 @@ function simple_rss_poster_activate() {
     add_option('simple_rss_poster_post_time', '00:00');
     add_option('simple_rss_poster_post_title', 'Latest Links');
     add_option('simple_rss_poster_post_category', 0);
+    add_option('simple_rss_poster_post_status', 'publish');
+    add_option('simple_rss_poster_link_format', 'full_link');
+    add_option('simple_rss_poster_full_replacements', '');
     add_option('simple_rss_poster_title_replacements', '');
     add_option('simple_rss_poster_auto_strip_suspicious', false);
     
@@ -922,19 +1105,3 @@ function simple_rss_poster_deactivate() {
     }
 }
 register_deactivation_hook(__FILE__, 'simple_rss_poster_deactivate');
-
-/**
- * Plugin uninstall (optional - uncomment to enable cleanup on delete)
- * Note: This would go in a separate uninstall.php file for best practices
- */
-// register_uninstall_hook(__FILE__, 'simple_rss_poster_uninstall');
-// function simple_rss_poster_uninstall() {
-//     delete_option('simple_rss_poster_feed_url');
-//     delete_option('simple_rss_poster_post_title');
-//     delete_option('simple_rss_poster_post_time');
-//     delete_option('simple_rss_poster_post_category');
-//     delete_option('simple_rss_poster_posted_links');
-//     delete_option('simple_rss_poster_scheduled_post_status');
-//     delete_option('simple_rss_poster_title_replacements');
-//     delete_option('simple_rss_poster_auto_strip_suspicious');
-// }
