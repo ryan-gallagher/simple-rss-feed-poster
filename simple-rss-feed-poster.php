@@ -2,12 +2,21 @@
 /*
 Plugin Name: Simple RSS Feed Poster
 Description: Fetches and posts new links from a single RSS feed, sorted alphabetically, with scheduled posting and preview.
-Version: 2.3.0
+Version: 2.3.2
 Author: Ryan Gallagher
 */
 
 /*
 Changelog:
+2.3.2 - Fixed: Duplicate success message display on manual post
+        Added: Auto-append timestamp to feed URL to prevent caching issues
+        Added: Sorting now ignores leading "The", "A", "An" articles
+        Added: Increased feed fetch timeout from 10 to 30 seconds
+        Added: Retry logic (up to 3 attempts with 5 second delay between)
+        Added: Activity log showing last 15 events (replaces single status line)
+
+2.3.1 - Fixed: Reduced RSS feed cache duration from 12 hours to 30 minutes so new items appear faster
+
 2.3.0 - Added: Post days selection (choose specific days for weekly/custom schedules)
         Added: Minimum items threshold (skip posting if not enough new links)
         Added: Post header and footer text options
@@ -44,6 +53,119 @@ define('SIMPLE_RSS_POSTER_MAX_TRACKED_LINKS', 500);
 define('SIMPLE_RSS_POSTER_FEED_ITEM_LIMIT', 100);
 define('SIMPLE_RSS_POSTER_CRON_HOOK', 'simple_rss_poster_scheduled_post');
 define('SIMPLE_RSS_POSTER_DAYS', ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']);
+define('SIMPLE_RSS_POSTER_FEED_CACHE_DURATION', 1800); // 30 minutes in seconds
+define('SIMPLE_RSS_POSTER_FEED_TIMEOUT', 30); // 30 seconds timeout
+define('SIMPLE_RSS_POSTER_RETRY_ATTEMPTS', 3);
+define('SIMPLE_RSS_POSTER_RETRY_DELAY', 5); // 5 seconds between retries
+define('SIMPLE_RSS_POSTER_MAX_LOG_ENTRIES', 15);
+
+//------------------------------------------------------------------------------
+// 1b. Feed Fetching Helper
+//------------------------------------------------------------------------------
+
+/**
+ * Fetch an RSS feed with reduced cache duration, extended timeout, and retry logic.
+ * 
+ * @param string $feed_url The URL of the feed to fetch
+ * @return SimplePie|WP_Error SimplePie object on success, WP_Error on failure
+ */
+function simple_rss_poster_fetch_feed($feed_url) {
+    include_once(ABSPATH . WPINC . '/feed.php');
+    
+    // Append timestamp to prevent caching at the feed source level
+    $cache_buster = strpos($feed_url, '?') !== false ? '&' : '?';
+    $cache_buster .= '_nocache=' . time();
+    $feed_url_with_timestamp = $feed_url . $cache_buster;
+    
+    // Temporarily reduce cache duration
+    $cache_filter = function($lifetime) {
+        return SIMPLE_RSS_POSTER_FEED_CACHE_DURATION;
+    };
+    
+    // Increase timeout
+    $timeout_filter = function($timeout) {
+        return SIMPLE_RSS_POSTER_FEED_TIMEOUT;
+    };
+    
+    add_filter('wp_feed_cache_transient_lifetime', $cache_filter);
+    add_filter('http_request_timeout', $timeout_filter);
+    
+    $last_error = null;
+    
+    // Retry logic
+    for ($attempt = 1; $attempt <= SIMPLE_RSS_POSTER_RETRY_ATTEMPTS; $attempt++) {
+        $rss = fetch_feed($feed_url_with_timestamp);
+        
+        if (!is_wp_error($rss)) {
+            // Success - clean up filters and return
+            remove_filter('wp_feed_cache_transient_lifetime', $cache_filter);
+            remove_filter('http_request_timeout', $timeout_filter);
+            return $rss;
+        }
+        
+        $last_error = $rss;
+        
+        // If this isn't the last attempt, wait before retrying
+        if ($attempt < SIMPLE_RSS_POSTER_RETRY_ATTEMPTS) {
+            sleep(SIMPLE_RSS_POSTER_RETRY_DELAY);
+            
+            // Clear the feed cache before retry to ensure fresh fetch
+            $cache_key = 'feed_' . md5($feed_url_with_timestamp);
+            delete_transient($cache_key);
+        }
+    }
+    
+    // All attempts failed - clean up and return the last error
+    remove_filter('wp_feed_cache_transient_lifetime', $cache_filter);
+    remove_filter('http_request_timeout', $timeout_filter);
+    
+    return $last_error;
+}
+
+//------------------------------------------------------------------------------
+// 1c. Activity Log Helper
+//------------------------------------------------------------------------------
+
+/**
+ * Add an entry to the activity log.
+ * 
+ * @param string $message The log message
+ * @param string $type Type of entry: 'success', 'error', 'warning', 'info'
+ */
+function simple_rss_poster_add_log_entry($message, $type = 'info') {
+    $log = get_option('simple_rss_poster_activity_log', []);
+    
+    // Add new entry at the beginning
+    array_unshift($log, [
+        'timestamp' => current_time('mysql'),
+        'message'   => $message,
+        'type'      => $type
+    ]);
+    
+    // Keep only the last N entries
+    $log = array_slice($log, 0, SIMPLE_RSS_POSTER_MAX_LOG_ENTRIES);
+    
+    update_option('simple_rss_poster_activity_log', $log);
+    
+    // Also update the simple status for backward compatibility
+    update_option('simple_rss_poster_scheduled_post_status', '[' . wp_date('Y-m-d H:i:s') . '] ' . $message);
+}
+
+/**
+ * Get the activity log.
+ * 
+ * @return array Array of log entries
+ */
+function simple_rss_poster_get_activity_log() {
+    return get_option('simple_rss_poster_activity_log', []);
+}
+
+/**
+ * Clear the activity log.
+ */
+function simple_rss_poster_clear_activity_log() {
+    update_option('simple_rss_poster_activity_log', []);
+}
 
 //------------------------------------------------------------------------------
 // 2. Sanitization & Registration
@@ -250,9 +372,9 @@ function simple_rss_poster_settings_page() {
     $full_replacements   = get_option('simple_rss_poster_full_replacements', '');
     $title_replacements  = get_option('simple_rss_poster_title_replacements', '');
     $auto_strip          = get_option('simple_rss_poster_auto_strip_suspicious', false);
-    $status              = get_option('simple_rss_poster_scheduled_post_status', '');
     $categories          = get_categories(['hide_empty' => false]);
     $tracked_count       = count(get_option('simple_rss_poster_posted_links', []));
+    $activity_log        = simple_rss_poster_get_activity_log();
 
     // Get next scheduled run from WP-Cron (fixed timezone display)
     $next_scheduled = wp_next_scheduled(SIMPLE_RSS_POSTER_CRON_HOOK);
@@ -267,7 +389,7 @@ function simple_rss_poster_settings_page() {
     <div class="wrap">
         <h1>Simple RSS Feed Poster</h1>
         
-        <?php settings_errors(); ?>
+        <?php settings_errors('simple_rss_poster_messages'); ?>
         
         <form method="post" action="options.php">
             <?php settings_fields('simple_rss_poster_settings_group'); ?>
@@ -469,14 +591,51 @@ function simple_rss_poster_settings_page() {
                 <td><?php echo esc_html($next_run); ?></td>
             </tr>
             <tr>
-                <th>Last Activity</th>
-                <td><?php echo esc_html($status ?: 'No activity logged yet.'); ?></td>
-            </tr>
-            <tr>
                 <th>Tracked Links</th>
                 <td><?php echo esc_html($tracked_count); ?> / <?php echo SIMPLE_RSS_POSTER_MAX_TRACKED_LINKS; ?></td>
             </tr>
         </table>
+
+        <h3>Activity Log</h3>
+        <div style="max-width: 800px; max-height: 300px; overflow-y: auto; border: 1px solid #ccd0d4; background: #fff;">
+            <?php if (empty($activity_log)) : ?>
+                <p style="padding: 10px; margin: 0; color: #666;"><em>No activity logged yet.</em></p>
+            <?php else : ?>
+                <table class="widefat striped" style="border: none;">
+                    <tbody>
+                        <?php foreach ($activity_log as $entry) : 
+                            $type_colors = [
+                                'success' => '#00a32a',
+                                'error'   => '#d63638',
+                                'warning' => '#dba617',
+                                'info'    => '#2271b1'
+                            ];
+                            $color = isset($type_colors[$entry['type']]) ? $type_colors[$entry['type']] : $type_colors['info'];
+                        ?>
+                            <tr>
+                                <td style="width: 160px; white-space: nowrap; color: #666;">
+                                    <?php echo esc_html($entry['timestamp']); ?>
+                                </td>
+                                <td style="border-left: 3px solid <?php echo esc_attr($color); ?>; padding-left: 10px;">
+                                    <?php echo esc_html($entry['message']); ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php endif; ?>
+        </div>
+        <p>
+            <form method="post" style="display: inline;">
+                <?php wp_nonce_field('simple_rss_poster_clear_log', 'clear_log_nonce'); ?>
+                <input type="submit" 
+                       name="simple_rss_poster_clear_log" 
+                       class="button button-link" 
+                       value="Clear Log"
+                       onclick="return confirm('Clear all activity log entries?');"
+                       style="color: #b32d2e; text-decoration: none;">
+            </form>
+        </p>
 
         <hr>
 
@@ -496,6 +655,15 @@ function simple_rss_poster_settings_page() {
                        name="simple_rss_poster_create_post" 
                        class="button button-primary" 
                        value="Create Post Now"
+                       <?php disabled(empty($feed_url)); ?>>
+            </form>
+
+            <form method="post">
+                <?php wp_nonce_field('simple_rss_poster_clear_cache', 'clear_cache_nonce'); ?>
+                <input type="submit" 
+                       name="simple_rss_poster_clear_cache" 
+                       class="button" 
+                       value="Clear Feed Cache"
                        <?php disabled(empty($feed_url)); ?>>
             </form>
 
@@ -764,6 +932,16 @@ function simple_rss_poster_format_link($prefix, $title, $link, $format = 'full_l
     }
 }
 
+/**
+ * Strip leading articles (The, A, An) for sorting purposes.
+ */
+function simple_rss_poster_get_sort_key($prefix, $title) {
+    $sort_key = !empty($prefix) ? $prefix . ': ' . $title : $title;
+    // Remove leading "The ", "A ", "An " (case-insensitive)
+    $sort_key = preg_replace('/^(The|A|An)\s+/i', '', $sort_key);
+    return $sort_key;
+}
+
 //------------------------------------------------------------------------------
 // 5. Feed Processing Logic
 //------------------------------------------------------------------------------
@@ -803,10 +981,10 @@ function simple_rss_poster_process_feed_items($rss_items, $full_replacements = [
         $new_links[] = $link;
     }
 
-    // Sort alphabetically
+    // Sort alphabetically, ignoring leading articles (The, A, An)
     usort($new_items, function($a, $b) {
-        $a_sort = !empty($a['prefix']) ? $a['prefix'] . ': ' . $a['title'] : $a['title'];
-        $b_sort = !empty($b['prefix']) ? $b['prefix'] . ': ' . $b['title'] : $b['title'];
+        $a_sort = simple_rss_poster_get_sort_key($a['prefix'], $a['title']);
+        $b_sort = simple_rss_poster_get_sort_key($b['prefix'], $b['title']);
         return strcasecmp($a_sort, $b_sort);
     });
 
@@ -866,9 +1044,7 @@ function simple_rss_poster_ajax_preview() {
     $full_replacements = simple_rss_poster_parse_replacements($full_replacements_raw);
     $prefix_replacements = simple_rss_poster_parse_replacements($title_replacements_raw);
 
-    include_once(ABSPATH . WPINC . '/feed.php');
-    
-    $rss = fetch_feed($feed_url);
+    $rss = simple_rss_poster_fetch_feed($feed_url);
     if (is_wp_error($rss)) {
         wp_send_json_error('Error fetching feed: ' . esc_html($rss->get_error_message()));
         return;
@@ -969,9 +1145,8 @@ function simple_rss_poster_handle_manual_post() {
         );
     }
     
-    set_transient('settings_errors', get_settings_errors(), 30);
-    
-    wp_redirect(admin_url('options-general.php?page=simple-rss-poster-settings&settings-updated=true'));
+    // Redirect without settings-updated=true to avoid duplicate messages from options.php
+    wp_redirect(admin_url('options-general.php?page=simple-rss-poster-settings'));
     exit;
 }
 add_action('admin_init', 'simple_rss_poster_handle_manual_post');
@@ -993,7 +1168,7 @@ function simple_rss_poster_handle_reset() {
     }
     
     delete_option('simple_rss_poster_posted_links');
-    update_option('simple_rss_poster_scheduled_post_status', 'History reset at ' . wp_date('Y-m-d H:i:s'));
+    simple_rss_poster_add_log_entry('Posting history reset by user', 'info');
     
     add_settings_error(
         'simple_rss_poster_messages',
@@ -1002,12 +1177,89 @@ function simple_rss_poster_handle_reset() {
         'success'
     );
     
-    set_transient('settings_errors', get_settings_errors(), 30);
-    
-    wp_redirect(admin_url('options-general.php?page=simple-rss-poster-settings&settings-updated=true'));
+    wp_redirect(admin_url('options-general.php?page=simple-rss-poster-settings'));
     exit;
 }
 add_action('admin_init', 'simple_rss_poster_handle_reset');
+
+/**
+ * Clear Feed Cache Handler
+ */
+function simple_rss_poster_handle_clear_cache() {
+    if (!isset($_POST['simple_rss_poster_clear_cache'])) {
+        return;
+    }
+    
+    if (!isset($_POST['clear_cache_nonce']) || !wp_verify_nonce($_POST['clear_cache_nonce'], 'simple_rss_poster_clear_cache')) {
+        wp_die('Security check failed.');
+    }
+    
+    if (!current_user_can('manage_options')) {
+        wp_die('Permission denied.');
+    }
+    
+    // Get the feed URL and clear its cache
+    $feed_url = get_option('simple_rss_poster_feed_url', '');
+    if (!empty($feed_url)) {
+        // WordPress stores feed caches as transients with a hash of the URL
+        $cache_key = 'feed_' . md5($feed_url);
+        delete_transient($cache_key);
+        
+        // Also try the SimplePie cache key format
+        $cache_key_sp = 'feed_mod_' . md5($feed_url);
+        delete_transient($cache_key_sp);
+        
+        // Clear any other potential feed transients
+        global $wpdb;
+        $wpdb->query(
+            $wpdb->prepare(
+                "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+                '_transient%_feed_' . md5($feed_url) . '%'
+            )
+        );
+    }
+    
+    add_settings_error(
+        'simple_rss_poster_messages',
+        'cache_cleared',
+        'Feed cache has been cleared. The preview will now fetch fresh data.',
+        'success'
+    );
+    
+    wp_redirect(admin_url('options-general.php?page=simple-rss-poster-settings'));
+    exit;
+}
+add_action('admin_init', 'simple_rss_poster_handle_clear_cache');
+
+/**
+ * Clear Activity Log Handler
+ */
+function simple_rss_poster_handle_clear_log() {
+    if (!isset($_POST['simple_rss_poster_clear_log'])) {
+        return;
+    }
+    
+    if (!isset($_POST['clear_log_nonce']) || !wp_verify_nonce($_POST['clear_log_nonce'], 'simple_rss_poster_clear_log')) {
+        wp_die('Security check failed.');
+    }
+    
+    if (!current_user_can('manage_options')) {
+        wp_die('Permission denied.');
+    }
+    
+    simple_rss_poster_clear_activity_log();
+    
+    add_settings_error(
+        'simple_rss_poster_messages',
+        'log_cleared',
+        'Activity log has been cleared.',
+        'success'
+    );
+    
+    wp_redirect(admin_url('options-general.php?page=simple-rss-poster-settings'));
+    exit;
+}
+add_action('admin_init', 'simple_rss_poster_handle_clear_log');
 
 /**
  * Core Posting Engine
@@ -1025,20 +1277,20 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
     $title_replacements_raw = get_option('simple_rss_poster_title_replacements', '');
     $auto_strip = get_option('simple_rss_poster_auto_strip_suspicious', false);
     
+    $trigger_label = ($trigger === 'manual') ? 'Manual' : 'Scheduled';
+    
     if (empty($url)) {
         $error = new WP_Error('no_feed_url', 'No feed URL configured.');
-        simple_rss_poster_log_status($trigger, $error);
+        simple_rss_poster_add_log_entry($trigger_label . ' post failed: No feed URL configured', 'error');
         return $error;
     }
     
     $full_replacements = simple_rss_poster_parse_replacements($full_replacements_raw);
     $prefix_replacements = simple_rss_poster_parse_replacements($title_replacements_raw);
     
-    include_once(ABSPATH . WPINC . '/feed.php');
-    
-    $rss = fetch_feed($url);
+    $rss = simple_rss_poster_fetch_feed($url);
     if (is_wp_error($rss)) {
-        simple_rss_poster_log_status($trigger, $rss);
+        simple_rss_poster_add_log_entry($trigger_label . ' post failed: ' . $rss->get_error_message(), 'error');
         return $rss;
     }
 
@@ -1052,13 +1304,16 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
     $item_count = count($data['items']);
     
     if ($item_count === 0) {
-        simple_rss_poster_log_status($trigger, null, 0);
+        simple_rss_poster_add_log_entry($trigger_label . ' run: No new items to post', 'info');
         return false;
     }
     
     // Check minimum items threshold
     if ($item_count < $min_items) {
-        simple_rss_poster_log_status($trigger, null, $item_count, null, $post_status, $min_items);
+        simple_rss_poster_add_log_entry(
+            sprintf('%s run: Only %d item(s) found, minimum is %d. Skipped.', $trigger_label, $item_count, $min_items),
+            'warning'
+        );
         return false;
     }
 
@@ -1099,7 +1354,7 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
     ], true);
 
     if (is_wp_error($post_id)) {
-        simple_rss_poster_log_status($trigger, $post_id);
+        simple_rss_poster_add_log_entry($trigger_label . ' post failed: ' . $post_id->get_error_message(), 'error');
         return $post_id;
     }
 
@@ -1108,30 +1363,13 @@ function simple_rss_poster_execute_post($trigger = 'scheduled') {
     $updated_links = simple_rss_poster_prune_links($current_links, $data['links']);
     update_option('simple_rss_poster_posted_links', $updated_links);
     
-    simple_rss_poster_log_status($trigger, null, $item_count, $post_id, $post_status);
+    $status_label = ($post_status === 'draft') ? 'draft' : 'post';
+    simple_rss_poster_add_log_entry(
+        sprintf('%s %s created with %d items (Post ID: %d)', $trigger_label, $status_label, $item_count, $post_id),
+        'success'
+    );
     
     return $post_id;
-}
-
-/**
- * Log status message for admin display
- */
-function simple_rss_poster_log_status($trigger, $error = null, $item_count = 0, $post_id = null, $post_status = 'publish', $min_items = null) {
-    $timestamp = wp_date('Y-m-d H:i:s');
-    $trigger_label = ($trigger === 'manual') ? 'Manual' : 'Scheduled';
-    $status_label = ($post_status === 'draft') ? 'draft' : 'post';
-    
-    if (is_wp_error($error)) {
-        $message = sprintf('[%s] %s post failed: %s', $timestamp, $trigger_label, $error->get_error_message());
-    } elseif ($item_count === 0) {
-        $message = sprintf('[%s] %s run: No new items to post.', $timestamp, $trigger_label);
-    } elseif ($min_items !== null && $item_count < $min_items) {
-        $message = sprintf('[%s] %s run: Only %d item(s) found, minimum is %d. Skipped.', $timestamp, $trigger_label, $item_count, $min_items);
-    } else {
-        $message = sprintf('[%s] %s %s created with %d items (Post ID: %d)', $timestamp, $trigger_label, $status_label, $item_count, $post_id);
-    }
-    
-    update_option('simple_rss_poster_scheduled_post_status', $message);
 }
 
 //------------------------------------------------------------------------------
@@ -1248,6 +1486,7 @@ function simple_rss_poster_activate() {
     add_option('simple_rss_poster_full_replacements', '');
     add_option('simple_rss_poster_title_replacements', '');
     add_option('simple_rss_poster_auto_strip_suspicious', false);
+    add_option('simple_rss_poster_activity_log', []);
     
     simple_rss_poster_schedule_next_post();
 }
