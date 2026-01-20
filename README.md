@@ -5,7 +5,7 @@ A WordPress plugin that automatically creates daily or weekly digest posts from 
 ## Features
 
 - **Flexible scheduling**: Choose specific days of the week and time to post (daily, weekdays only, weekly, etc.)
-- **Alphabetical sorting** of links for easy scanning
+- **Alphabetical sorting** of links for easy scanning (ignores leading "The", "A", "An")
 - **Duplicate detection** to prevent reposting (tracks last 500 links)
 - **Minimum items threshold**: Skip posting if not enough new links
 - **Post header and footer**: Add custom intro/outro text to each digest
@@ -21,6 +21,11 @@ A WordPress plugin that automatically creates daily or weekly digest posts from 
 - **Post as draft or publish** immediately
 - **Live preview** in the admin panel
 - **Manual posting** button for on-demand digest creation
+- **Reliability features**:
+  - 30-second feed fetch timeout
+  - Automatic retry (up to 3 attempts with 5-second delay)
+  - Activity log showing last 15 events
+  - Cache-busting to ensure fresh feed data
 
 ## Installation
 
@@ -87,6 +92,20 @@ kottke.org => Jason Kottke
 
 Enable this option to automatically remove prefixes that look like hostnames or URL fragments (contain dots but no spaces), even without an explicit rule.
 
+## Status & Activity Log
+
+The settings page shows:
+
+- **Next Scheduled Run**: When the next automatic post will be created
+- **Tracked Links**: How many links are being tracked for duplicate detection (max 500)
+- **Activity Log**: Rolling log of the last 15 events including:
+  - Successful posts (with item count and post ID)
+  - Failed posts (with error message)
+  - Skipped runs (below minimum threshold or no new items)
+  - History resets
+
+The activity log is color-coded by type (green for success, red for errors, yellow for warnings, blue for info) and can be cleared at any time.
+
 ## Use Case: Feedbin → Pinboard → WordPress
 
 This plugin was designed for a workflow where:
@@ -112,6 +131,17 @@ define('DISABLE_WP_CRON', true);
 ```
 
 ## Changelog
+
+### 2.3.2
+- Fixed: Duplicate success message display on manual post
+- Added: Auto-append timestamp to feed URL to prevent caching issues
+- Added: Sorting now ignores leading "The", "A", "An" articles
+- Added: Increased feed fetch timeout from 10 to 30 seconds
+- Added: Retry logic (up to 3 attempts with 5-second delay between)
+- Added: Activity log showing last 15 events (replaces single status line)
+
+### 2.3.1
+- Fixed: Reduced RSS feed cache duration from 12 hours to 30 minutes so new items appear faster
 
 ### 2.3.0
 - Added: Post days selection (choose specific days for weekly/custom schedules)
@@ -148,4 +178,4 @@ GPL v2 or later
 
 ## Author
 
-Your Name
+Ryan Gallagher
