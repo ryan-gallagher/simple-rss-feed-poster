@@ -2,12 +2,14 @@
 /*
 Plugin Name: Simple RSS Feed Poster
 Description: Fetches and posts new links from a single RSS feed, sorted alphabetically, with scheduled posting and preview.
-Version: 2.3.2
+Version: 2.3.3
 Author: Ryan Gallagher
 */
 
 /*
 Changelog:
+2.3.3 - Fixed: Timeout setting now correctly applies to SimplePie feed fetcher (was using wrong hook)
+
 2.3.2 - Fixed: Duplicate success message display on manual post
         Added: Auto-append timestamp to feed URL to prevent caching issues
         Added: Sorting now ignores leading "The", "A", "An" articles
@@ -82,13 +84,13 @@ function simple_rss_poster_fetch_feed($feed_url) {
         return SIMPLE_RSS_POSTER_FEED_CACHE_DURATION;
     };
     
-    // Increase timeout
-    $timeout_filter = function($timeout) {
-        return SIMPLE_RSS_POSTER_FEED_TIMEOUT;
+    // Set timeout on SimplePie object directly
+    $timeout_filter = function($feed) {
+        $feed->set_timeout(SIMPLE_RSS_POSTER_FEED_TIMEOUT);
     };
     
     add_filter('wp_feed_cache_transient_lifetime', $cache_filter);
-    add_filter('http_request_timeout', $timeout_filter);
+    add_action('wp_feed_options', $timeout_filter);
     
     $last_error = null;
     
@@ -99,7 +101,7 @@ function simple_rss_poster_fetch_feed($feed_url) {
         if (!is_wp_error($rss)) {
             // Success - clean up filters and return
             remove_filter('wp_feed_cache_transient_lifetime', $cache_filter);
-            remove_filter('http_request_timeout', $timeout_filter);
+            remove_action('wp_feed_options', $timeout_filter);
             return $rss;
         }
         
@@ -117,7 +119,7 @@ function simple_rss_poster_fetch_feed($feed_url) {
     
     // All attempts failed - clean up and return the last error
     remove_filter('wp_feed_cache_transient_lifetime', $cache_filter);
-    remove_filter('http_request_timeout', $timeout_filter);
+    remove_action('wp_feed_options', $timeout_filter);
     
     return $last_error;
 }
